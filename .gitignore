@@ -1,0 +1,10 @@
+pycache/
+*.py[cod]
+*$py.class
+*.log
+vehiculos_config.txt
+simulador_ground_truth.json
+paracomprobar.txt
+.vscode/
+.idea/
+.env
