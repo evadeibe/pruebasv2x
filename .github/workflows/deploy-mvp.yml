@@ -1,4 +1,69 @@
-- name: Desplegar versión nueva en instancias EC2 vía AWS SSM y esperar confirmación
+name: V2X Full System CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-test-publish-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar entorno de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar dependencias y ejecutar pruebas unitarias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m py_compile v2x_logic.py productor_v2x.py rsu.py consumidor_v2x.py test_eventos.py
+          python -m unittest -v test_eventos.py
+
+      - name: Construir imágenes Docker (RSU y V2X-SERVICE)
+        run: |
+          docker build -f Dockerfile.rsu -t v2x-rsu-image .
+          docker build -f Dockerfile.service -t v2x-service-image .
+
+      - name: Configurar credenciales de AWS
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Iniciar sesión en Amazon ECR
+        if: github.event_name == 'push'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Etiquetar (latest + short SHA) y publicar imágenes en ECR
+        if: github.event_name == 'push'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: sdis-v2x-mvp
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+
+          docker tag v2x-rsu-image $ECR_REGISTRY/$ECR_REPOSITORY:rsu-latest
+          docker tag v2x-rsu-image $ECR_REGISTRY/$ECR_REPOSITORY:rsu-$SHORT_SHA
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:rsu-latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:rsu-$SHORT_SHA
+
+          docker tag v2x-service-image $ECR_REGISTRY/$ECR_REPOSITORY:service-latest
+          docker tag v2x-service-image $ECR_REGISTRY/$ECR_REPOSITORY:service-$SHORT_SHA
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:service-latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:service-$SHORT_SHA
+
+      - name: Desplegar versión nueva en instancias EC2 vía AWS SSM y esperar confirmación
         if: github.event_name == 'push'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
