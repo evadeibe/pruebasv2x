@@ -1,69 +1,4 @@
-name: V2X Full System CI/CD Pipeline
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-
-jobs:
-  build-test-publish-deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout del repositorio
-        uses: actions/checkout@v4
-
-      - name: Configurar entorno de Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Instalar dependencias y ejecutar pruebas unitarias
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m py_compile v2x_logic.py productor_v2x.py rsu.py consumidor_v2x.py test_eventos.py
-          python -m unittest -v test_eventos.py
-
-      - name: Construir imágenes Docker (RSU y V2X-SERVICE)
-        run: |
-          docker build -f Dockerfile.rsu -t v2x-rsu-image .
-          docker build -f Dockerfile.service -t v2x-service-image .
-
-      - name: Configurar credenciales de AWS
-        if: github.event_name == 'push'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: us-east-1
-
-      - name: Iniciar sesión en Amazon ECR
-        if: github.event_name == 'push'
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Etiquetar (latest + short SHA) y publicar imágenes en ECR
-        if: github.event_name == 'push'
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: sdis-v2x-mvp
-        run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
-
-          docker tag v2x-rsu-image $ECR_REGISTRY/$ECR_REPOSITORY:rsu-latest
-          docker tag v2x-rsu-image $ECR_REGISTRY/$ECR_REPOSITORY:rsu-$SHORT_SHA
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:rsu-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:rsu-$SHORT_SHA
-
-          docker tag v2x-service-image $ECR_REGISTRY/$ECR_REPOSITORY:service-latest
-          docker tag v2x-service-image $ECR_REGISTRY/$ECR_REPOSITORY:service-$SHORT_SHA
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:service-latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:service-$SHORT_SHA
-
-      - name: Desplegar versión nueva en instancias EC2 vía AWS SSM y esperar confirmación
+- name: Desplegar versión nueva en instancias EC2 vía AWS SSM y esperar confirmación
         if: github.event_name == 'push'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -79,16 +14,19 @@ jobs:
             exit 1
           fi
 
+          # Script inteligente: detecta qué rol tiene cada instancia por su tag 'Role' o 'Name'
           PARAMS_JSON=$(jq -n \
             --arg reg "$ECR_REGISTRY" \
             --arg tag "$IMAGE_TAG" \
             '{commands: [
-              "set -e",
-              "cd /opt/v2x || cd /home/ec2-user/v2x || cd /home/ubuntu/v2x",
               "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin " + $reg,
-              "export ECR_REGISTRY=" + $reg + " IMAGE_TAG=" + $tag,
-              "docker compose pull",
-              "docker compose up -d --remove-orphans"
+              "TOKEN=$(curl -s -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\")",
+              "IID=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)",
+              "ROLE=$(aws ec2 describe-tags --filters \"Name=resource-id,Values=$IID\" \"Name=key,Values=Role,Name\" --query \"Tags[0].Value\" --output text --region us-east-1)",
+              "echo \"Desplegando en instancia $IID con rol: $ROLE\"",
+              "if echo \"$ROLE\" | grep -iq \"RSU-1\\|RSU1\"; then docker pull " + $reg + "/sdis-v2x-mvp:rsu-" + $tag + " && docker stop rsu-1 || true && docker rm rsu-1 || true && docker run -d --name rsu-1 --restart unless-stopped -p 80:80 -p 1883:1883 -e RSU_ID=rsu-1 -e AWS_DEFAULT_REGION=us-east-1 " + $reg + "/sdis-v2x-mvp:rsu-" + $tag + "; fi",
+              "if echo \"$ROLE\" | grep -iq \"RSU-2\\|RSU2\"; then docker pull " + $reg + "/sdis-v2x-mvp:rsu-" + $tag + " && docker stop rsu-2 || true && docker rm rsu-2 || true && docker run -d --name rsu-2 --restart unless-stopped -p 80:80 -p 1883:1883 -e RSU_ID=rsu-2 -e AWS_DEFAULT_REGION=us-east-1 " + $reg + "/sdis-v2x-mvp:rsu-" + $tag + "; fi",
+              "if echo \"$ROLE\" | grep -iq \"SERVICE\"; then docker pull " + $reg + "/sdis-v2x-mvp:service-" + $tag + " && docker stop v2x-service || true && docker rm v2x-service || true && docker run -d --name v2x-service --restart unless-stopped -p 8080:8080 -e AWS_DEFAULT_REGION=us-east-1 " + $reg + "/sdis-v2x-mvp:service-" + $tag + "; fi"
             ]}')
 
           CMD_ID=$(aws ssm send-command \
